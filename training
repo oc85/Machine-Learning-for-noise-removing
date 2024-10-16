@@ -1,0 +1,408 @@
+# Imports
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import transforms
+from torch.utils.data import DataLoader
+from IPython.display import clear_output
+import pickle
+
+# Constants
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+IMSIZE = 128
+BATCH_SIZE = 4
+MEAN = (0.0, 0.0, 0.0)
+STD = (0.7, 0.7, 0.7)
+CHECKPOINT_DIR = 'checkpoints_attention1'
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+# Load data paths
+BASE_DIR = r"C:\Users\ph1oc\Documents\DATASETS\Dataset_Confocal\dataset_confocal"
+train_input_dir = os.path.join(BASE_DIR, 'train_input')
+train_output_dir = os.path.join(BASE_DIR, 'train_output')
+train_shabby_paths = sorted(os.listdir(train_input_dir), key=lambda x: int(re.search(r'(\d+)', x).group()))
+cleaned_img_paths = sorted(os.listdir(train_output_dir), key=lambda x: int(re.search(r'(\d+)', x).group()))
+
+# Load and preprocess images
+def load_images(paths, base_dir, size):
+    images = []
+    for filename in tqdm(paths, desc=f"Loading images from {base_dir}"):
+        filepath = os.path.join(base_dir, filename)
+        image = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
+        image = cv2.resize(image, (size, size))
+        images.append(image)
+    return np.array(images)
+
+X_train = load_images(train_shabby_paths, train_input_dir, IMSIZE)
+y_train = load_images(cleaned_img_paths, train_output_dir, IMSIZE)
+
+# Print data info
+print('Training set input shape:', X_train.shape)
+print('Training set output shape:', y_train.shape)
+print('Training set input min/max:', X_train.min(), X_train.max())
+print('Training set output min/max:', y_train.min(), y_train.max())
+
+# Transform class
+class Transform:
+    def __init__(self, resize=IMSIZE, mean=MEAN, std=STD):
+        self.data_transform = transforms.Compose([
+            transforms.Resize((resize, resize)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std)
+        ])
+        
+    def __call__(self, img: Image.Image):
+        return self.data_transform(img)
+
+# Dataset class
+class CustomDataset:
+    def __init__(self, train_in, train_gt, is_valid=False):
+        self.train_in = train_in
+        self.train_gt = train_gt
+        self.transformer = Transform()
+        self.is_valid = is_valid
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        src = np.stack([self.train_in[idx]] * 3, axis=-1).astype(np.uint8)
+        dst = np.stack([self.train_gt[idx]] * 3, axis=-1).astype(np.uint8)
+        
+        mode = 3 if self.is_valid else random.randint(0, 3)
+        if mode == 3:
+            input_tensor = self.transformer(Image.fromarray(src))
+            output_tensor = self.transformer(Image.fromarray(dst))
+        else:
+            input_img = cv2.flip(src, mode - 1)
+            output_img = cv2.flip(dst, mode - 1)
+            input_tensor = self.transformer(Image.fromarray(input_img))
+            output_tensor = self.transformer(Image.fromarray(output_img))
+
+        return input_tensor, output_tensor
+    
+    def __len__(self):
+        return len(self.train_in)
+
+# DataLoader setup
+train_ds = CustomDataset(X_train, y_train)
+val_ds = CustomDataset(X_train, y_train, True)
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+
+# Self-Attention Layer
+class SelfAttention(nn.Module):
+    def __init__(self, in_dim):
+        super(SelfAttention, self).__init__()
+        self.query_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
+        self.softmax = nn.Softmax(dim=-1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        m_batchsize, C, width, height = x.size()
+        proj_query = self.query_conv(x).view(m_batchsize, -1, width * height).permute(0, 2, 1)
+        proj_key = self.key_conv(x).view(m_batchsize, -1, width * height)
+        energy = torch.bmm(proj_query, proj_key)
+        attention = self.softmax(energy)
+        proj_value = self.value_conv(x).view(m_batchsize, -1, width * height)
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(m_batchsize, C, width, height)
+        out = self.gamma * out + x
+        return out
+
+# Generator class
+class Generator(nn.Module):
+    def __init__(self, d=64):
+        super(Generator, self).__init__()
+        # U-Net encoder
+        self.conv1 = nn.Conv2d(3, d, 4, 2, 1)
+        self.conv2 = nn.Conv2d(d, d * 2, 4, 2, 1)
+        self.conv2_bn = nn.BatchNorm2d(d * 2)
+        self.conv3 = nn.Conv2d(d * 2, d * 4, 4, 2, 1)
+        self.conv3_bn = nn.BatchNorm2d(d * 4)
+        self.conv4 = nn.Conv2d(d * 4, d * 8, 4, 2, 1)
+        self.conv4_bn = nn.BatchNorm2d(d * 8)
+        self.conv5 = nn.Conv2d(d * 8, d * 8, 4, 2, 1)
+        self.conv5_bn = nn.BatchNorm2d(d * 8)
+        self.conv6 = nn.Conv2d(d * 8, d * 8, 4, 2, 1)
+
+        # Self-Attention Layer
+        self.attn1 = SelfAttention(d * 8)
+
+        # U-Net decoder
+        self.deconv1 = nn.ConvTranspose2d(d * 8, d * 8, 4, 2, 1)
+        self.deconv1_bn = nn.BatchNorm2d(d * 8)
+        self.deconv2 = nn.ConvTranspose2d(d * 8 * 2, d * 8, 4, 2, 1)
+        self.deconv2_bn = nn.BatchNorm2d(d * 8)
+        self.deconv3 = nn.ConvTranspose2d(d * 8 * 2, d * 4, 4, 2, 1)
+        self.deconv3_bn = nn.BatchNorm2d(d * 4)
+        self.deconv4 = nn.ConvTranspose2d(d * 4 * 2, d * 2, 4, 2, 1)
+        self.deconv4_bn = nn.BatchNorm2d(d * 2)
+        self.deconv5 = nn.ConvTranspose2d(d * 2 * 2, d, 4, 2, 1)
+        self.deconv5_bn = nn.BatchNorm2d(d)
+        self.deconv6 = nn.ConvTranspose2d(d * 2, 3, 4, 2, 1)
+
+    def weight_init(self, mean, std):
+        for m in self._modules:
+            normal_init(self._modules[m], mean, std)
+
+    def forward(self, input):
+        e1 = self.conv1(input)
+        e2 = self.conv2_bn(self.conv2(F.leaky_relu(e1, 0.2)))
+        e3 = self.conv3_bn(self.conv3(F.leaky_relu(e2, 0.2)))
+        e4 = self.conv4_bn(self.conv4(F.leaky_relu(e3, 0.2)))
+        e5 = self.conv5_bn(self.conv5(F.leaky_relu(e4, 0.2)))
+        e6 = self.conv6(F.leaky_relu(e5, 0.2))
+
+        # Apply self-attention before decoding
+        e6 = self.attn1(e6)
+
+        d1 = F.dropout(self.deconv1_bn(self.deconv1(F.relu(e6))), 0.5, training=True)
+        d1 = torch.cat([d1, e5], 1)
+        d2 = F.dropout(self.deconv2_bn(self.deconv2(F.relu(d1))), 0.5, training=True)
+        d2 = torch.cat([d2, e4], 1)
+        d3 = F.dropout(self.deconv3_bn(self.deconv3(F.relu(d2))), 0.5, training=True)
+        d3 = torch.cat
+        [d3, e3], 1)
+        d4 = self.deconv4_bn(self.deconv4(F.relu(d3)))
+        d4 = torch.cat([d4, e2], 1)
+        d5 = self.deconv5_bn(self.deconv5(F.relu(d4)))
+        d5 = torch.cat([d5, e1], 1)
+        d6 = self.deconv6(F.relu(d5))
+        o = torch.tanh(d6)
+
+        return o
+
+# Function to initialize weights
+def normal_init(m, mean, std):
+    if isinstance(m, nn.ConvTranspose2d) or isinstance(m, nn.Conv2d):
+        m.weight.data.normal_(mean, std)
+        if m.bias is not None:
+            m.bias.data.zero_()
+
+# Example usage
+# Initialize model
+generator = Generator()
+generator.weight_init(mean=0.0, std=0.02)
+
+# Load a batch of data
+train_iter = iter(train_dl)
+images, labels = next(train_iter)
+
+# Forward pass through the generator
+output = generator(images)
+
+# Display sample images
+def show_img_sample(img: torch.Tensor, img1: torch.Tensor):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    ax = axes.ravel()
+    a = img.permute(1, 2, 0).cpu().numpy()
+    b = img1.permute(1, 2, 0).cpu().numpy()
+    ax[0].imshow(a)
+    ax[0].set_xticks([])
+    ax[0].set_yticks([])
+    ax[0].set_title("Input Image", c="g")
+    ax[1].imshow(b)
+    ax[1].set_xticks([])
+    ax[1].set_yticks([])
+    ax[1].set_title("Label Image", c="g")
+    plt.subplots_adjust(wspace=0, hspace=0)
+    plt.show()
+
+# Show a sample from the batch
+show_img_sample(images[0], labels[0])
+
+#########################################################################################
+
+# Discriminator class
+class Discriminator(nn.Module):
+    def __init__(self, d=128):
+        super(Discriminator, self).__init__()
+        self.conv1 = nn.Conv2d(6, d, 4, 2, 1)
+        self.conv2 = nn.Conv2d(d, d * 2, 4, 2, 1)
+        self.conv2_bn = nn.BatchNorm2d(d * 2)
+        self.conv3 = nn.Conv2d(d * 2, d * 4, 4, 2, 1)
+        self.conv3_bn = nn.BatchNorm2d(d * 4)
+        self.conv4 = nn.Conv2d(d * 4, d * 8, 4, 2, 1)
+        self.conv4_bn = nn.BatchNorm2d(d * 8)
+        self.attn1 = SelfAttention(d * 8)
+        self.conv5 = nn.Conv2d(d * 8, 1, 4, 1, 1)
+
+    def weight_init(self, mean, std):
+        for m in self._modules:
+            normal_init(self._modules[m], mean, std)
+
+    def forward(self, input, label):
+        x = torch.cat([input, label], 1)
+        x = F.leaky_relu(self.conv1(x), 0.2)
+        x = F.leaky_relu(self.conv2_bn(self.conv2(x)), 0.2)
+        x = F.leaky_relu(self.conv3_bn(self.conv3(x)), 0.2)
+        x = F.leaky_relu(self.conv4_bn(self.conv4(x)), 0.2)
+        x = self.attn1(x)
+        x = self.conv5(x)
+        return x
+
+# Additional functions
+def de_norm(img):
+    img = img.mul(torch.FloatTensor(STD).view(3, 1, 1))
+    img = img.add(torch.FloatTensor(MEAN).view(3, 1, 1)).detach().numpy()
+    img = np.transpose(img, (1, 2, 0))
+    return img
+
+def save_image_batch(fake_img, epoch):
+    os.makedirs("generated", exist_ok=True)
+    for i in range(BATCH_SIZE):
+        output_img = (255 * de_norm(fake_img[i])).astype(np.uint8)
+        output_img = cv2.resize(output_img, (IMSIZE, IMSIZE))
+        cv2.imwrite(f'generated/fake{epoch}.png', output_img)
+
+def save_model(G, D, epoch):
+    os.makedirs("weight", exist_ok=True)
+    torch.save(G.state_dict(), f"weight/G{epoch + 1}.pth")
+    torch.save(D.state_dict(), f"weight/D{epoch + 1}.pth")
+
+def plot_losses(generator_losses, discriminator_losses):
+    plt.figure(figsize=(14, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(generator_losses)
+    plt.title("Generator Loss")
+    plt.subplot(1, 2, 2)
+    plt.plot(discriminator_losses)
+    plt.title("Discriminator Loss")
+    plt.show()
+
+def save_checkpoint(G, D, epoch, save_path):
+    torch.save({
+        'epoch': epoch,
+        'generator_state_dict': G.state_dict(),
+        'discriminator_state_dict': D.state_dict(),
+    }, save_path)
+
+def load_checkpoint(G, D, checkpoint_path):
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        G.load_state_dict(checkpoint['generator_state_dict'])
+        D.load_state_dict(checkpoint['discriminator_state_dict'])
+        return checkpoint['epoch']
+    return 0
+
+def train_fn(train_dl, G, D, criterion_bce, criterion_mae, optimizer_g, optimizer_d):
+    G.train()
+    D.train()
+    LAMBDA = 100.0
+    total_loss_g, total_loss_d = [], []
+
+    for input_img, real_img in tqdm(train_dl, desc="Training"):
+        input_img = input_img.to(DEVICE)
+        real_img = real_img.to(DEVICE)
+
+        # Generate fake images
+        fake_img = G(input_img)
+
+        # Discriminator output for fake images
+        out_fake = D(fake_img, input_img)
+
+        # Labels for loss calculation
+        real_label = torch.ones_like(out_fake).to(DEVICE)
+        fake_label = torch.zeros_like(out_fake).to(DEVICE)
+
+        # Generator Loss
+        loss_g_bce = criterion_bce(out_fake, real_label)
+        loss_g_mae = criterion_mae(fake_img, real_img)
+        loss_g = loss_g_bce + LAMBDA * loss_g_mae
+        total_loss_g.append(loss_g.item())
+
+        optimizer_g.zero_grad()
+        loss_g.backward(retain_graph=True)
+        optimizer_g.step()
+
+        # Discriminator Loss with real images
+        out_real = D(real_img, input_img)
+        loss_d_real = criterion_bce(out_real, real_label)
+
+        # Discriminator Loss with fake images
+        out_fake = D(fake_img.detach(), input_img)
+        loss_d_fake = criterion_bce(out_fake, fake_label)
+        loss_d = loss_d_real + loss_d_fake
+        total_loss_d.append(loss_d.item())
+
+        optimizer_d.zero_grad()
+        loss_d.backward()
+        optimizer_d.step()
+
+    return np.mean(total_loss_g), np.mean(total_loss_d), fake_img.detach().cpu()
+
+def train_loop(train_dl, G, D, num_epoch, lr=0.0002, betas=(0.5, 0.999)):
+    G.to(DEVICE)
+    D.to(DEVICE)
+    optimizer_g = optim.Adam(G.parameters(), lr=lr, betas=betas)
+    optimizer_d = optim.Adam(D.parameters(), lr=lr, betas=betas)
+    criterion_mae = nn.L1Loss()
+    criterion_bce = nn.BCEWithLogitsLoss()
+
+    # Load the last checkpoint
+    checkpoint_file = os.path.join(CHECKPOINT_DIR, 'model.pth')
+    last_epoch = load_checkpoint(G, D, checkpoint_file)
+
+    for e in range(last_epoch, num_epoch):
+        clear_output(wait=True)
+        print(f'Epoch: {e + 1}')
+        loss_g, loss_d, fake_img = train_fn(train_dl, G, D, criterion_bce, criterion_mae, optimizer_g, optimizer_d)
+        print(f'Epoch [{e + 1}/{num_epoch}], Generator Loss: {loss_g:.4f}, Discriminator Loss: {loss_d:.4f}')
+
+        # Save model every 30 epochs
+        if (e + 1) % 30 == 0:
+            save_path = os.path.join(CHECKPOINT_DIR, f'epoch_{e + 1}.pth')
+            save_checkpoint(G, D, e + 1, save_path)
+            save_checkpoint(G, D, e + 1, checkpoint_file)
+
+    # Save final model
+    save_checkpoint(G, D, num_epoch, checkpoint_file)
+    print("Training complete and model saved.")
+    return G, D
+
+# Initialize models
+G = Generator()
+D = Discriminator()
+G.weight_init(mean=0.0, std=0.02)
+D.weight_init(mean=0.0, std=0.02)
+
+# Train models
+EPOCH = 10000
+trained_G, trained_D = train_loop(train_dl, G, D, EPOCH)
+
+# Post-training processing
+def process_image(idx):
+    img = X_train[idx]
+    img = np.stack((img,) * 3, axis=-1).astype(np.uint8)
+    transformer = Transform()
+
+    with torch.no_grad():
+        img = transformer(Image.fromarray(img))
+        img = img.unsqueeze(0).to(DEVICE)
+
+        time_start = time.time()
+        res_img = G(img)
+        print("Processing time (seconds):", np.round(time.time() - time_start, 2))
+
+        output_img = (255 * de_norm(res_img[0].cpu())).astype(np.uint8)
+        output_img = cv2.resize(output_img, (400, 400))
+
+        smoothed = cv2.GaussianBlur(output_img, (9, 9), 10)
+        unsharped = cv2.addWeighted(output_img, 1.5, smoothed, -0.5, 0)
+        gray = cv2.cvtColor(unsharped, cv2.COLOR_BGR2GRAY)
+
+    return gray
+
+# Display results
+idx = 22
+gray = process_image(idx)
+
+plt.figure(figsize=(12, 6))
+plt.subplot
