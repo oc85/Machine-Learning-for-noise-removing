@@ -29,5 +29,6 @@ This model can be applied in domains requiring image enhancement, such as medica
 
 Training was performed on 256 images (without augmentation) during 5000 iterations on GPU:
 
-![image](https://github.com/user-attachments/assets/a158a0a6-5a19-4d44-be50-b70e4a55a808)
+![image](https://github.com/user-attachments/assets/5e541cb2-ba7e-4917-a0b1-be24e9dca968)
+
 
