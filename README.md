@@ -4,6 +4,8 @@ __Description:__
 
 This project involves developing a deep learning model for image-to-image translation using Generative Adversarial Networks (GANs) with a self-attention mechanism. The primary goal is to transform low-resolution images into high-resolution ones, improving image quality and clarity by leveraging GANs with self-attention layers to capture long-range dependencies within the images.
 
+![image](https://github.com/user-attachments/assets/5e541cb2-ba7e-4917-a0b1-be24e9dca968)
+
  __Key Components:__
 
  __Data Preprocessing:__
@@ -29,6 +31,6 @@ This model can be applied in domains requiring image enhancement, such as medica
 
 Training was performed on 256 images (without augmentation) during 5000 iterations on GPU:
 
-![image](https://github.com/user-attachments/assets/5e541cb2-ba7e-4917-a0b1-be24e9dca968)
+
 
 
